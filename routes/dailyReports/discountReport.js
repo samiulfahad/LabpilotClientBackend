@@ -3,7 +3,8 @@ import toObjectId from "../../utils/db.js";
 const summaryQuerySchema = {
   schema: {
     tags: ["Discount Report"],
-    summary: "Get discount totals grouped by staff for a date range, split by source (OPD/IPD)",
+    summary:
+      "Get discount and lab-adjustment totals grouped by staff, and discount totals grouped by referrer, for a date range",
     querystring: {
       type: "object",
       required: ["startDate", "endDate"],
@@ -21,8 +22,6 @@ async function discountReportRoutes(fastify) {
   const indoorCol = () => fastify.mongo.db.collection("indoorPatients");
   const labId = (req) => toObjectId(req.user.labId);
 
-  // Excludes soft-deleted indoor patients from every IPD discount figure.
-  // Missing `deletion` field (pre-soft-delete legacy docs) still matches null.
   const notDeletedFilter = (req) => ({ labId: labId(req), "deletion.at": null });
 
   fastify.addHook("onRequest", fastify.authenticate);
@@ -34,12 +33,13 @@ async function discountReportRoutes(fastify) {
 
     if (startDate > endDate) return reply.code(400).send({ error: "startDate must be before endDate" });
 
-    const isHospital = req.user.type === "hospital"; // diagnosticCenter labs have no IPD data
+    const isHospital = req.user.type === "hospital";
 
     try {
       // ── Discount stats per staff (OPD invoices) ──────────────────────────
-      // referrerDiscount is fixed at invoice creation time, so the staff
-      // attributed here is whoever created the invoice (createdBy).
+      // Each line item now also carries the invoice's referrer id/name so
+      // the staff-wise drill-down can show "who the discount was for", not
+      // just "who entered it".
       const discountStatsPipeline = [
         {
           $match: {
@@ -61,26 +61,89 @@ async function discountReportRoutes(fastify) {
                 amount: "$amount.referrerDiscount",
                 at: "$createdAt",
                 source: "opd",
+                referrerId: "$referrer.id",
+                referrerName: "$referrer.name",
               },
             },
           },
         },
+        { $addFields: { invoices: { $slice: ["$invoices", 200] } } },
+      ];
+
+      // ── Lab adjustment stats per staff (OPD invoices only) ───────────────
+      const labAdjustmentStatsPipeline = [
         {
-          $addFields: {
-            invoices: { $slice: ["$invoices", 200] },
+          $match: {
+            labId: labId(req),
+            "deletion.status": false,
+            createdAt: { $gte: startDate, $lte: endDate },
+            "amount.labAdjustment": { $gt: 0 },
           },
         },
+        {
+          $group: {
+            _id: "$createdBy.id",
+            staffName: { $last: "$createdBy.name" },
+            totalLabAdjustment: { $sum: "$amount.labAdjustment" },
+            invoices: {
+              $push: {
+                invoiceId: "$invoiceId",
+                patient: "$patient.name",
+                amount: "$amount.labAdjustment",
+                at: "$createdAt",
+                source: "opd",
+              },
+            },
+          },
+        },
+        { $addFields: { invoices: { $slice: ["$invoices", 200] } } },
+      ];
+
+      // ── Discount stats per referrer (OPD invoices only) ──────────────────
+      // Groups by `referrer.id` when the invoice's referrer resolved to a
+      // registered referrer document; otherwise falls back to a
+      // name-keyed bucket (mirrors the doctor-field convention: a typed
+      // name that didn't match a registered referrer still has `name` set
+      // but `id: null`). IPD has no per-discount referrer identity
+      // (`discounts[].providedBy` is just a hospital/doctor/referrer
+      // category, not a specific referrer), so this is OPD-only.
+      const referrerDiscountStatsPipeline = [
+        {
+          $match: {
+            labId: labId(req),
+            "deletion.status": false,
+            createdAt: { $gte: startDate, $lte: endDate },
+            "amount.referrerDiscount": { $gt: 0 },
+          },
+        },
+        {
+          $group: {
+            _id: {
+              $cond: [
+                "$referrer.id",
+                "$referrer.id",
+                { $concat: ["name:", { $ifNull: ["$referrer.name", "__none__"] }] },
+              ],
+            },
+            referrerName: { $last: "$referrer.name" },
+            totalDiscount: { $sum: "$amount.referrerDiscount" },
+            invoices: {
+              $push: {
+                invoiceId: "$invoiceId",
+                patient: "$patient.name",
+                amount: "$amount.referrerDiscount",
+                at: "$createdAt",
+                source: "opd",
+                staffId: "$createdBy.id",
+                staffName: "$createdBy.name",
+              },
+            },
+          },
+        },
+        { $addFields: { invoices: { $slice: ["$invoices", 200] } } },
       ];
 
       // ── Discount stats per staff (IPD discounts) ─────────────────────────
-      // Indoor patients keep discounts in a flat `discounts[]` array (one
-      // entry per applied discount, possibly several per patient), so we
-      // look 90 days back to catch admissions started earlier, then filter
-      // the discounts themselves to the requested window. Diagnostic
-      // centers have no IPD module at all, so skip this query entirely for
-      // them rather than hitting an irrelevant collection. Soft-deleted
-      // admissions are excluded via notDeletedFilter so their discounts
-      // never contribute to a staff member's totals.
       const indoorDiscountStatsPipeline = [
         {
           $match: {
@@ -89,11 +152,7 @@ async function discountReportRoutes(fastify) {
           },
         },
         { $unwind: "$discounts" },
-        {
-          $match: {
-            "discounts.appliedAt": { $gte: startDate, $lte: endDate },
-          },
-        },
+        { $match: { "discounts.appliedAt": { $gte: startDate, $lte: endDate } } },
         {
           $group: {
             _id: "$discounts.appliedBy.id",
@@ -112,29 +171,51 @@ async function discountReportRoutes(fastify) {
             },
           },
         },
-        {
-          $addFields: {
-            patients: { $slice: ["$patients", 200] },
-          },
-        },
+        { $addFields: { patients: { $slice: ["$patients", 200] } } },
       ];
 
-      const [opdDiscountRows, ipdDiscountRows] = await Promise.all([
+      const [opdDiscountRows, labAdjustmentRows, referrerDiscountRows, ipdDiscountRows] = await Promise.all([
         col().aggregate(discountStatsPipeline, { allowDiskUse: true }).toArray(),
+        col().aggregate(labAdjustmentStatsPipeline, { allowDiskUse: true }).toArray(),
+        col().aggregate(referrerDiscountStatsPipeline, { allowDiskUse: true }).toArray(),
         isHospital ? indoorCol().aggregate(indoorDiscountStatsPipeline, { allowDiskUse: true }).toArray() : [],
       ]);
 
-      // ── Merge OPD + IPD rows by staff id, keeping source split ───────────
+      // ── Merge OPD discount + lab adjustment + IPD discount rows by staff id ──
       const discountMap = new Map();
+
       for (const row of opdDiscountRows) {
         discountMap.set(String(row._id), {
           staffName: row.staffName,
           opdDiscount: row.totalDiscount,
           ipdDiscount: 0,
+          labAdjustment: 0,
           invoices: [...row.invoices],
           patients: [],
+          labAdjustmentInvoices: [],
         });
       }
+
+      for (const row of labAdjustmentRows) {
+        const key = String(row._id);
+        const existing = discountMap.get(key);
+        if (existing) {
+          existing.labAdjustment += row.totalLabAdjustment;
+          existing.labAdjustmentInvoices.push(...row.invoices);
+          existing.staffName = existing.staffName ?? row.staffName;
+        } else {
+          discountMap.set(key, {
+            staffName: row.staffName,
+            opdDiscount: 0,
+            ipdDiscount: 0,
+            labAdjustment: row.totalLabAdjustment,
+            invoices: [],
+            patients: [],
+            labAdjustmentInvoices: [...row.invoices],
+          });
+        }
+      }
+
       for (const row of ipdDiscountRows) {
         const key = String(row._id);
         const existing = discountMap.get(key);
@@ -147,8 +228,10 @@ async function discountReportRoutes(fastify) {
             staffName: row.staffName,
             opdDiscount: 0,
             ipdDiscount: row.totalDiscount,
+            labAdjustment: 0,
             invoices: [],
             patients: [...row.patients],
+            labAdjustmentInvoices: [],
           });
         }
       }
@@ -157,29 +240,41 @@ async function discountReportRoutes(fastify) {
       for (const [staffId, row] of discountMap) {
         row.invoices.sort((a, b) => a.at - b.at);
         row.patients.sort((a, b) => a.at - b.at);
+        row.labAdjustmentInvoices.sort((a, b) => a.at - b.at);
         staff.push({
           staffId,
           name: row.staffName ?? "Unknown",
           totalDiscount: row.opdDiscount + row.ipdDiscount,
           opdDiscount: row.opdDiscount,
           ipdDiscount: row.ipdDiscount,
+          labAdjustment: row.labAdjustment,
           invoices: row.invoices.slice(0, 200),
           patients: row.patients.slice(0, 200),
+          labAdjustmentInvoices: row.labAdjustmentInvoices.slice(0, 200),
         });
       }
       staff.sort((a, b) => b.totalDiscount - a.totalDiscount);
 
-      // ── Grand totals ──────────────────────────────────────────────────────
+      // ── Referrer-wise view (OPD discount only) ───────────────────────────
+      const referrers = referrerDiscountRows.map((row) => ({
+        referrerId: String(row._id),
+        name: row.referrerName || "রেফারার ছাড়া",
+        totalDiscount: row.totalDiscount,
+        invoices: [...row.invoices].sort((a, b) => a.at - b.at).slice(0, 200),
+      }));
+      referrers.sort((a, b) => b.totalDiscount - a.totalDiscount);
+
       const totals = staff.reduce(
         (acc, s) => ({
           totalDiscount: acc.totalDiscount + s.totalDiscount,
           opdDiscount: acc.opdDiscount + s.opdDiscount,
           ipdDiscount: acc.ipdDiscount + s.ipdDiscount,
+          labAdjustment: acc.labAdjustment + s.labAdjustment,
         }),
-        { totalDiscount: 0, opdDiscount: 0, ipdDiscount: 0 },
+        { totalDiscount: 0, opdDiscount: 0, ipdDiscount: 0, labAdjustment: 0 },
       );
 
-      return reply.send({ staff, totals });
+      return reply.send({ staff, referrers, totals });
     } catch (err) {
       req.log.error(err);
       return reply.code(500).send({ error: "Failed to fetch discount report" });

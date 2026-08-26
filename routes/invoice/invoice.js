@@ -554,14 +554,12 @@ async function invoiceRoutes(fastify) {
       // /login or refresh cycle; the billing-update route clears sessions
       // for the lab to force that re-sync promptly.
       //
-      // The fee only ever applies when the invoice contains at least one
-      // "online" test (schemaId set) — checked directly against the tests
-      // array already in the request body, no extra DB lookup needed there
-      // either.
-      const hasOnlineTest = tests.some((t) => !!t.schemaId);
+      // Mirrors the frontend's computeAmount(): the fee applies whenever the
+      // lab forces it (and has a fee configured), or the client explicitly
+      // marked isOnlineFeePaid. No dependency on what's in the cart.
       const configuredFee = req.user.billing?.feePerInvoice || 0;
       const feeForced = !!req.user.billing?.forceInvoiceFee;
-      const expectedFeeApplied = hasOnlineTest && (feeForced ? configuredFee > 0 : isOnlineFeePaid);
+      const expectedFeeApplied = feeForced ? configuredFee > 0 : isOnlineFeePaid;
       const expectedFee = expectedFeeApplied ? configuredFee : 0;
 
       if (Math.round((amount.invoiceFee || 0) * 100) !== Math.round(expectedFee * 100)) {
@@ -629,7 +627,7 @@ async function invoiceRoutes(fastify) {
       const referrerCommissionTestWise = round2(tests.reduce((sum, t) => sum + (t.commission || 0), 0));
 
       // ── Insert invoice ──────────────────────────────────────────────────
-     const invoiceCreationResult = await col().insertOne({
+      const invoiceCreationResult = await col().insertOne({
         labId: labId(req),
         labKey: String(req.user.labKey),
         invoiceId,

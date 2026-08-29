@@ -6,6 +6,9 @@ import swaggerUi from "@fastify/swagger-ui";
 import fastifyCookie from "@fastify/cookie";
 import dotenv from "dotenv";
 
+// Tuition Media
+import tutorCvRoutes from "./routes/tuitionMedia/tutionMedia.routes.js";
+
 // Plugins
 import authPlugin from "./plugins/auth.js";
 import smsPlugin from "./plugins/sms.js";
@@ -140,6 +143,9 @@ await fastify.register(swaggerUi, {
 
 // ── 7. Routes
 const API = "/v1";
+
+// Tuition Media
+fastify.register(tutorCvRoutes, { prefix: API });
 
 // Auth
 fastify.register(authRoutes, { prefix: API });

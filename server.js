@@ -8,6 +8,7 @@ import dotenv from "dotenv";
 
 // Tuition Media
 import tutorCvRoutes from "./routes/tuitionMedia/tutionMedia.routes.js";
+import instituteRoutes from "./routes/tuitionMedia/institute.routes.js";
 
 // Plugins
 import authPlugin from "./plugins/auth.js";
@@ -147,6 +148,8 @@ const API = "/v1";
 
 // Tuition Media
 fastify.register(tutorCvRoutes, { prefix: API });
+fastify.register(instituteRoutes, { prefix: API });
+
 
 // Auth
 fastify.register(authRoutes, { prefix: API });

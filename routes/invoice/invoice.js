@@ -508,7 +508,6 @@ async function invoiceRoutes(fastify) {
   // ── POST /invoice/add ─────────────────────────────────────────────────────
   fastify.post("/invoice/add", { ...addInvoiceSchema, ...requireCreate }, async (req, reply) => {
     try {
-      console.log(req.body.doctor);
       const {
         patient,
         referrer,
@@ -936,10 +935,18 @@ async function invoiceRoutes(fastify) {
 
   // ── GET /invoice/:invoiceId ────────────────────────────────────────────────
   // FIX: previously returned the full raw document (no projection) — leaked
-  // internal fields (labId, labKey, createdBy, deletion, collections history,
-  // test commissions, referrer id, etc.) to whatever consumes this route
-  // (PrintInvoice.jsx's print/share view). Project down to exactly what
-  // normaliseInvoice() in that component reads.
+  // internal fields (labId, labKey, deletion, test commissions, referrer id,
+  // etc.) to whatever consumes this route (PrintInvoice.jsx's print/share
+  // view, and InvoiceDetailsModal in InvoiceList.jsx). Project down to
+  // exactly what those consumers read.
+  //
+  // FIX (this pass): the projection below was missing createdBy, delivery
+  // (status + by.name), and collections entirely — so InvoiceDetailsModal's
+  // "তৈরিকারী" (created-by), delivery-status, and collection-history
+  // sections always rendered blank/false even though InvoiceRow/InvoiceCard
+  // on the list page showed them fine (that list comes from a *different*
+  // route, GET /invoice/all, whose projection already included them).
+  // Added the three below so both surfaces agree.
   //
   // Intentionally unguarded — see header cleanup notes: powers the print/share
   // view, which isn't gated by "invoiceList" on the frontend.
@@ -951,6 +958,9 @@ async function invoiceRoutes(fastify) {
           projection: {
             invoiceId: 1,
             createdAt: 1,
+            "createdBy.name": 1,
+            "delivery.status": 1,
+            "delivery.by.name": 1,
             "patient.name": 1,
             "patient.gender": 1,
             "patient.age": 1,
@@ -966,11 +976,13 @@ async function invoiceRoutes(fastify) {
             "products.quantity": 1,
             "amount.initial": 1,
             "amount.referrerDiscount": 1,
+            "amount.referrerCommission": 1,
             "amount.labAdjustment": 1,
             "amount.final": 1,
             "amount.paid": 1,
             "amount.invoiceFee": 1,
             paymentMode: 1,
+            collections: 1,
           },
         },
       );

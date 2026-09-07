@@ -228,12 +228,9 @@ async function cashmemoRoutes(fastify) {
   // Active-invoice figures (totalInvoices/initial/paid/etc.) are scoped by
   // createdAt in range — that's "business done in this window".
   //
-  // referrerCommission (%-based) and referrerCommissionTestWise (sum of each
-  // test's own commission amount) are both summed here so the client can
-  // toggle between the two views without a second request. Neither is summed
-  // for an invoice with an unregistered referrer (referrer.id null — "self"/
-  // walk-in) even if amount.referrerCommission(TestWise) has a stored value:
-  // there's no one to pay, so it must not count toward payable commission.
+  // Referrer commission is intentionally NOT computed here — it's calculated
+  // in a separate module/endpoint now, so this summary only carries the raw
+  // billing/collection figures.
   //
   // totalInvoiceFee sums amount.invoiceFee across active invoices created in
   // range — the online-report fee (added on top of the patient's total, per
@@ -280,21 +277,6 @@ async function cashmemoRoutes(fastify) {
                   initial: { $sum: { $ifNull: ["$amount.initial", 0] } },
                   labAdjustment: { $sum: { $ifNull: ["$amount.labAdjustment", 0] } },
                   referrerDiscount: { $sum: { $ifNull: ["$amount.referrerDiscount", 0] } },
-                  // No commission (test-wise or %) for unregistered referrers.
-                  referrerCommission: {
-                    $sum: {
-                      $cond: [{ $ne: ["$referrer.id", null] }, { $ifNull: ["$amount.referrerCommission", 0] }, 0],
-                    },
-                  },
-                  referrerCommissionTestWise: {
-                    $sum: {
-                      $cond: [
-                        { $ne: ["$referrer.id", null] },
-                        { $ifNull: ["$amount.referrerCommissionTestWise", 0] },
-                        0,
-                      ],
-                    },
-                  },
                   totalFinal: { $sum: { $ifNull: ["$amount.final", 0] } },
                   totalNet: { $sum: { $ifNull: ["$amount.net", 0] } },
                   totalPaid: { $sum: { $ifNull: ["$amount.paid", 0] } },
@@ -308,8 +290,6 @@ async function cashmemoRoutes(fastify) {
                   initial: 1,
                   labAdjustment: 1,
                   referrerDiscount: 1,
-                  referrerCommission: 1,
-                  referrerCommissionTestWise: 1,
                   totalFinal: 1,
                   totalNet: 1,
                   totalPaid: 1,
@@ -372,8 +352,6 @@ async function cashmemoRoutes(fastify) {
         initial: 0,
         labAdjustment: 0,
         referrerDiscount: 0,
-        referrerCommission: 0,
-        referrerCommissionTestWise: 0,
         totalFinal: 0,
         totalNet: 0,
         totalPaid: 0,
@@ -475,6 +453,11 @@ async function cashmemoRoutes(fastify) {
   //
   // diagnosticCenter labs have no IPD module — short-circuit before ever
   // touching the indoorPatients collection for them.
+  //
+  // NOTE: this endpoint's totalCommission (IPD, test-wise, sourced from
+  // indoorPatients.expenses[].commission) is a separate mechanism from the
+  // outdoor referrer commission that used to live in /cashmemo/summary — it
+  // was left untouched when that outdoor commission calc was moved out.
   fastify.get("/cashmemo/ipd-summary", ipdSummaryQuerySchema, async (req, reply) => {
     try {
       const range = parseDateRange(req, reply);

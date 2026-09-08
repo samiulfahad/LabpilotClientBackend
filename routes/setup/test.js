@@ -102,7 +102,7 @@ const createTestSchema = {
           type: "string",
           minLength: 2,
           maxLength: 500,
-          pattern: "^[a-zA-Z0-9\\s\\-_%/&,:'.()\\[\\]{}]+$",
+          pattern: "^[a-zA-Z0-9\\s\\-_%/&,:'.()\\[\\]{}+]+$",
           description: "Name of the test",
         },
         testId: {

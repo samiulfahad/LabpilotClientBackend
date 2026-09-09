@@ -210,10 +210,11 @@ const invoiceIdParamSchema = {
   properties: {
     invoiceId: {
       type: "string",
-      pattern: "^[0-9]{6,10}$",
-      minLength: 6,
+      pattern: "^[0-9a-zA-Z]{1,10}$",
+      minLength: 1,
       maxLength: 10,
-      description: "Sequential invoice ID: ddmm + per-lab daily sequence number (e.g. 090901)",
+      description:
+        "Invoice ID: either the new numeric ddmm + per-lab daily sequence format (e.g. 090901), or a legacy alphanumeric ID (e.g. HBV3629) — up to 10 alphanumeric characters",
     },
   },
 };
@@ -1013,7 +1014,7 @@ async function invoiceRoutes(fastify) {
     }
   });
 
-   // ── GET /invoice/:invoiceId ────────────────────────────────────────────────
+  // ── GET /invoice/:invoiceId ────────────────────────────────────────────────
   // FIX: previously returned the full raw document (no projection) — leaked
   // internal fields (labId, labKey, deletion, test commissions, referrer id,
   // etc.) to whatever consumes this route (PrintInvoice.jsx's print/share

@@ -32,6 +32,12 @@ const moneyFieldSchema = {
   multipleOf: 0.01,
 };
 
+// Fixed testCatalog category every lab/customer-created ("manual") test is
+// filed under — a single pre-seeded { _id: ..., name: "Created by Labs" }
+// document in testCategories, shared across all labs, distinct from the
+// real catalog categories.
+const MANUAL_TEST_CATEGORY_ID = "6aa0f23328b36d7a2a1819d6";
+
 // ─── Schemas ──────────────────────────────────────────────────────────────────
 
 const getAllTestsSchema = {
@@ -127,6 +133,40 @@ const createTestSchema = {
         commission: {
           ...moneyFieldSchema,
           description: "Referrer/staff commission on this test (max 2 decimal places)",
+        },
+      },
+    },
+  },
+};
+
+// Manual add — used when a lab can't find a test in the global catalog via
+// GET /test/catalog. Only takes a name + price (+ optional commission); the
+// route itself creates the catalog entry (under the fixed
+// MANUAL_TEST_CATEGORY_ID category) and the lab's own test in one go, so
+// there is no separate testId to supply.
+const createManualTestSchema = {
+  schema: {
+    tags: ["Tests"],
+    summary: "Manually add a test not found in the global catalog (creates both a catalog entry and the lab's test)",
+    body: {
+      type: "object",
+      required: ["name", "price"],
+      additionalProperties: false,
+      properties: {
+        name: {
+          type: "string",
+          minLength: 2,
+          maxLength: 500,
+          pattern: "^[a-zA-Z0-9\\s\\-_%/&,:'.()\\[\\]{}+]+$",
+          description: "Name of the test",
+        },
+        price: {
+          ...moneyFieldSchema,
+          description: "Price of the test (max 2 decimal places)",
+        },
+        commission: {
+          ...moneyFieldSchema,
+          description: "Referrer/staff commission on this test (optional, default 0)",
         },
       },
     },
@@ -346,6 +386,73 @@ async function testRoutes(fastify) {
     } catch (err) {
       req.log.error(err);
       return reply.code(500).send({ error: "Failed to create test" });
+    }
+  });
+
+  // ── POST /test/manual ─────────────────────────────────────────────────────
+  // Used when a lab searches the global catalog (GET /test/catalog) and
+  // can't find the test they need. Unlike POST /test above, there is no
+  // existing catalog testId to reference — this route creates one:
+  //   1. a new testCatalog doc, filed under the fixed
+  //      MANUAL_TEST_CATEGORY_ID ("Created by Labs") category, tagged with
+  //      which lab/staff added it (addedBylab / addedbyUser) so it's
+  //      traceable even though it's now visible to every lab via the shared
+  //      catalog;
+  //   2. the lab's own tests doc referencing that new catalog _id as
+  //      testId, same shape as POST /test.
+  // schemaId/isOnline start null/false — format gets attached later via the
+  // existing FormatModal flow, same as any other test.
+  fastify.post("/test/manual", { ...createManualTestSchema }, async (req, reply) => {
+    try {
+      const { name, price, commission } = req.body;
+      const trimmedName = name.trim();
+
+      const finalPrice = price ?? 0;
+      const finalCommission = commission ?? 0;
+      if (finalCommission > finalPrice) {
+        return reply.code(400).send({ error: "Commission cannot exceed price" });
+      }
+
+      // Case-insensitive duplicate check against this lab's own tests only —
+      // a manual test only needs to be unique within the lab that's adding
+      // it, not across the whole shared catalog.
+      const escapedName = trimmedName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const existing = await col().findOne({
+        labId: labId(req),
+        name: { $regex: `^${escapedName}$`, $options: "i" },
+      });
+      if (existing) return reply.code(409).send({ error: "A test with this name already exists" });
+
+      const categoryId = toObjectId(MANUAL_TEST_CATEGORY_ID);
+
+      const catalogDoc = {
+        name: trimmedName,
+        categoryId,
+        defaultSchemaId: null,
+        addedBylab: labId(req),
+        addedbyUser: {
+          id: toObjectId(req.user.id),
+          name: req.user.name,
+        },
+      };
+      const catalogResult = await catalogCol().insertOne(catalogDoc);
+
+      const testDoc = {
+        labId: labId(req),
+        name: trimmedName,
+        testId: catalogResult.insertedId, // ← generated just above, not an existing catalog entry
+        categoryId,
+        schemaId: null,
+        price: finalPrice,
+        commission: finalCommission,
+        createdAt: Date.now(),
+      };
+      const testResult = await col().insertOne(testDoc);
+
+      return reply.code(201).send({ _id: testResult.insertedId, ...testDoc });
+    } catch (err) {
+      req.log.error(err);
+      return reply.code(500).send({ error: "Failed to create manual test" });
     }
   });
 

@@ -597,9 +597,11 @@ async function invoiceRoutes(fastify) {
       // /login or refresh cycle; the billing-update route clears sessions
       // for the lab to force that re-sync promptly.
       //
-      // Mirrors the frontend's computeAmount(): the fee applies whenever the
-      // lab forces it (and has a fee configured), or the client explicitly
-      // marked isOnlineFeePaid. No dependency on what's in the cart.
+      // Simple rule, no dependency on what's in the cart:
+      //   - forceInvoiceFee: true  -> fee applies, UNLESS configuredFee is 0
+      //     (a forced fee of 0 is a valid "no fee" config, not an error)
+      //   - forceInvoiceFee: false -> fee applies only if the client marked
+      //     isOnlineFeePaid
       const configuredFee = req.user.billing?.feePerInvoice || 0;
       const feeForced = !!req.user.billing?.forceInvoiceFee;
       const expectedFeeApplied = feeForced ? configuredFee > 0 : isOnlineFeePaid;
@@ -684,8 +686,6 @@ async function invoiceRoutes(fastify) {
           name: patient.name,
           gender: patient.gender,
           age: patient.age,
-          // Optional — stored as an empty string when the staff didn't
-          // collect a contact number for this patient.
           contactNumber: patient.contactNumber ?? "",
         },
         referrer: referrer
@@ -708,9 +708,6 @@ async function invoiceRoutes(fastify) {
           price: t.price,
           schemaId: t.schemaId ? toObjectId(t.schemaId) : null,
           commission: t.commission || 0,
-          // Online tests (schemaId set) start with an empty report shell:
-          // sampleCollectionDate defaults to the invoice's creation time,
-          // reportDate is unset until the report is actually filed.
           ...(t.schemaId && {
             report: {
               sampleCollectionDate: createdAt,

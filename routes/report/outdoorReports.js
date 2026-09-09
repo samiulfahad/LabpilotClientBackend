@@ -10,6 +10,23 @@
  *    leak by _id lookup. Revisit only if testSchemas ever becomes lab-owned.
  *  - All other routes (add, update, dates, get-by-invoice) are gated on
  *    testReportUpload / testReportDownload, unchanged.
+ *  - invoiceId validation matches invoiceRoutes.js's invoiceIdParamSchema:
+ *    purely numeric, 6-10 digits (ddmm + per-lab daily sequence, e.g.
+ *    "090901", overflowing to "0909100" past 99/day). Previously this file
+ *    used a stale fixed-length (7 char) string check.
+ *  - Every invoice lookup now distinguishes "doesn't exist" (404) from
+ *    "exists but soft-deleted" (410, body includes `deleted: true`) via
+ *    findReportableInvoice() below, instead of treating both as a plain
+ *    404 (which itself was previously not checked at all — a deleted
+ *    invoice's tests could be viewed/reported on through this file even
+ *    though it's hidden from invoice/all and invoice/search).
+ *  - GET /outdoorReport/:invoiceId's projection must include
+ *    "deletion.status": 1. findReportableInvoice's soft-delete check reads
+ *    invoice.deletion?.status — under a projection that omits it, Mongo
+ *    strips the field entirely and the check silently no-ops, so a
+ *    soft-deleted invoice was returned as if active (search "found" it
+ *    fine; only add/update/dates, which fetch the full doc with no
+ *    projection, correctly 410'd).
  */
 
 import toObjectId from "../../utils/db.js";
@@ -32,6 +49,18 @@ const mergeReportDates = (existingReport, incomingReport) => ({
 });
 
 // ─── Route Schemas ────────────────────────────────────────────────────────────
+
+// invoiceId is "ddmm" (Asia/Dhaka) + a per-lab, per-day sequence number
+// zero-padded to at least 2 digits, e.g. "090901" ... "0909100" past 99/day.
+// Purely numeric, 6-10 digits. Kept in sync with invoiceIdParamSchema in
+// invoiceRoutes.js.
+const invoiceIdPropertySchema = {
+  type: "string",
+  pattern: "^[0-9]{6,10}$",
+  minLength: 6,
+  maxLength: 10,
+  description: "Sequential invoice ID: ddmm + per-lab daily sequence number (e.g. 090901)",
+};
 
 const getSchemaParamSchema = {
   schema: {
@@ -56,7 +85,7 @@ const addReportSchema = {
       required: ["report", "invoiceId", "testId"],
       properties: {
         report: { type: "object", description: "Report data keyed by schema field name" },
-        invoiceId: { type: "string", minLength: 7, maxLength: 7, description: "Invoice ID" },
+        invoiceId: invoiceIdPropertySchema,
         testId: { type: "string", minLength: 24, maxLength: 24, description: "ObjectId of the test" },
       },
     },
@@ -72,7 +101,7 @@ const updateReportSchema = {
       required: ["report", "invoiceId", "testId"],
       properties: {
         report: { type: "object", description: "Report data keyed by schema field name" },
-        invoiceId: { type: "string", minLength: 7, maxLength: 7, description: "Invoice ID" },
+        invoiceId: invoiceIdPropertySchema,
         testId: { type: "string", minLength: 24, maxLength: 24, description: "ObjectId of the test" },
       },
     },
@@ -87,7 +116,7 @@ const updateDatesSchema = {
       type: "object",
       required: ["invoiceId", "testId"],
       properties: {
-        invoiceId: { type: "string", minLength: 7, maxLength: 7, description: "Invoice ID" },
+        invoiceId: invoiceIdPropertySchema,
         testId: { type: "string", minLength: 24, maxLength: 24, description: "ObjectId of the test" },
         sampleCollectionDate: { type: "integer", description: "Unix timestamp (ms) of sample collection" },
         reportDate: { type: "integer", description: "Unix timestamp (ms) the report was finalized" },
@@ -104,7 +133,7 @@ const getReportSchema = {
       type: "object",
       required: ["invoiceId", "testId"],
       properties: {
-        invoiceId: { type: "string", minLength: 7, maxLength: 7, description: "Invoice ID" },
+        invoiceId: invoiceIdPropertySchema,
         testId: { type: "string", minLength: 24, maxLength: 24, description: "ObjectId of the test" },
       },
     },
@@ -118,6 +147,33 @@ async function outdoorReportRoutes(fastify) {
   const labId = (req) => toObjectId(req.user.labId);
   const by = (req) => ({ id: toObjectId(req.user.id), name: req.user.name });
 
+  // Looks up an invoice by invoiceId + labId (no deletion filter, so we can
+  // tell the two failure cases apart) and sends the appropriate error reply
+  // itself: 404 if it doesn't exist at all, 410 with `deleted: true` if it
+  // exists but was soft-deleted — a distinct signal so the frontend can show
+  // "this invoice was deleted" instead of a generic not-found. Returns the
+  // invoice doc on success, or `undefined` after already sending a reply —
+  // callers must `return` immediately when the result is falsy.
+  //
+  // IMPORTANT: any caller that passes a `projection` MUST include
+  // "deletion.status": 1 in it, or this check silently no-ops (see file
+  // header note).
+  const findReportableInvoice = async (req, reply, invoiceId, projection) => {
+    const invoice = await invoicesCollection().findOne(
+      { invoiceId, labId: labId(req) },
+      projection ? { projection } : undefined,
+    );
+    if (!invoice) {
+      reply.code(404).send({ error: "Invoice not found" });
+      return undefined;
+    }
+    if (invoice.deletion?.status) {
+      reply.code(410).send({ error: "This invoice has been deleted", deleted: true });
+      return undefined;
+    }
+    return invoice;
+  };
+
   fastify.addHook("onRequest", fastify.authenticate);
 
   const requireDownload = { onRequest: [fastify.authorize("testReportDownload")] };
@@ -127,41 +183,39 @@ async function outdoorReportRoutes(fastify) {
   fastify.get("/outdoorReport/:invoiceId", async (req, reply) => {
     try {
       const { invoiceId } = req.params;
-      const invoice = await fastify.mongo.db.collection("invoices").findOne(
-        { invoiceId: req.params.invoiceId, labId: labId(req) },
-        {
-          projection: {
-            _id: 0,
-            invoiceId: 1,
-            createdAt: 1,
-            "patient.name": 1,
-            "patient.gender": 1,
-            "patient.age": 1,
-            "patient.contactNumber": 1,
-            "amount.initial": 1,
-            "amount.final": 1,
-            "amount.paid": 1,
-            "tests.testId": 1,
-            "tests.name": 1,
-            "tests.price": 1,
-            "tests.schemaId": 1,
-            "tests.isCompleted": 1,
-            "tests.report.sampleCollectionDate": 1,
-            "tests.report.reportDate": 1,
-            // Previously missing — MetaModal on the frontend reads these
-            // four fields to show "Created by" / "Last edited by" in the
-            // details tab. Without them here, Mongo strips the fields from
-            // every response and the UI always shows "তথ্য নেই" (no info)
-            // regardless of whether the report was actually uploaded/edited.
-            "tests.completedAt": 1,
-            "tests.completedBy": 1,
-            "tests.updatedAt": 1,
-            "tests.updatedBy": 1,
-            paymentMode: 1,
-          },
-        },
-      );
-      if (!invoice) return reply.code(404).send({ error: "Invoice not found" });
+      const invoice = await findReportableInvoice(req, reply, invoiceId, {
+        _id: 0,
+        invoiceId: 1,
+        createdAt: 1,
+        "patient.name": 1,
+        "patient.gender": 1,
+        "patient.age": 1,
+        "patient.contactNumber": 1,
+        "amount.initial": 1,
+        "amount.final": 1,
+        "amount.paid": 1,
+        "tests.testId": 1,
+        "tests.name": 1,
+        "tests.price": 1,
+        "tests.schemaId": 1,
+        "tests.isCompleted": 1,
+        "tests.report.sampleCollectionDate": 1,
+        "tests.report.reportDate": 1,
+        // Previously missing — MetaModal on the frontend reads these
+        // four fields to show "Created by" / "Last edited by" in the
+        // details tab. Without them here, Mongo strips the fields from
+        // every response and the UI always shows "তথ্য নেই" (no info)
+        // regardless of whether the report was actually uploaded/edited.
+        "tests.completedAt": 1,
+        "tests.completedBy": 1,
+        "tests.updatedAt": 1,
+        "tests.updatedBy": 1,
+        paymentMode: 1,
+        // Required so findReportableInvoice's soft-delete check can
+        // actually see the field — see helper's doc comment.
+        "deletion.status": 1,
+      });
+      if (!invoice) return;
       return reply.send(invoice);
     } catch (err) {
       req.log.error(err);
@@ -189,8 +243,8 @@ async function outdoorReportRoutes(fastify) {
     try {
       const { report, invoiceId, testId } = req.body;
 
-      const invoice = await invoicesCollection().findOne({ invoiceId, labId: labId(req) });
-      if (!invoice) return reply.code(404).send({ error: "Invoice not found" });
+      const invoice = await findReportableInvoice(req, reply, invoiceId);
+      if (!invoice) return;
 
       const testIndex = findTestIndex(invoice.tests, testId);
       if (testIndex === -1) return reply.code(404).send({ error: "Test not found in this invoice" });
@@ -239,8 +293,8 @@ async function outdoorReportRoutes(fastify) {
     try {
       const { report, invoiceId, testId } = req.body;
 
-      const invoice = await invoicesCollection().findOne({ invoiceId, labId: labId(req) });
-      if (!invoice) return reply.code(404).send({ error: "Invoice not found" });
+      const invoice = await findReportableInvoice(req, reply, invoiceId);
+      if (!invoice) return;
 
       const testIndex = findTestIndex(invoice.tests, testId);
       if (testIndex === -1) return reply.code(404).send({ error: "Test not found in this invoice" });
@@ -277,8 +331,8 @@ async function outdoorReportRoutes(fastify) {
         return reply.code(400).send({ error: "At least one of sampleCollectionDate or reportDate is required" });
       }
 
-      const invoice = await invoicesCollection().findOne({ invoiceId, labId: labId(req) });
-      if (!invoice) return reply.code(404).send({ error: "Invoice not found" });
+      const invoice = await findReportableInvoice(req, reply, invoiceId);
+      if (!invoice) return;
 
       const testIndex = findTestIndex(invoice.tests, testId);
       if (testIndex === -1) return reply.code(404).send({ error: "Test not found in this invoice" });
@@ -311,8 +365,8 @@ async function outdoorReportRoutes(fastify) {
     try {
       const { invoiceId, testId } = req.params;
 
-      const invoice = await invoicesCollection().findOne({ invoiceId, labId: labId(req) });
-      if (!invoice) return reply.code(404).send({ error: "Invoice not found" });
+      const invoice = await findReportableInvoice(req, reply, invoiceId);
+      if (!invoice) return;
 
       const test = invoice.tests.find((t) => t.testId.toString() === testId.toString());
       if (!test) return reply.code(404).send({ error: "Test not found in this invoice" });

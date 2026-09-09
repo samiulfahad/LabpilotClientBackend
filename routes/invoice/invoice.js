@@ -1,5 +1,4 @@
 import toObjectId from "../../utils/db.js";
-import generateInvoiceId from "../../utils/generateInvoiceId.js";
 
 /**
  * ── Invoice document structure (as stored in "invoices" collection) ─────────
@@ -8,7 +7,15 @@ import generateInvoiceId from "../../utils/generateInvoiceId.js";
  *   _id: ObjectId,
  *   labId: ObjectId,
  *   labKey: string,                      // e.g. "1111"
- *   invoiceId: string,                   // e.g. "ABC1234" (3 letters excl. O + 4 non-zero digits)
+ *   invoiceId: string,                   // e.g. "090901" — ddmm (Asia/Dhaka) + a
+ *                                         // per-lab, per-calendar-day sequence
+ *                                         // number, zero-padded to 2 digits
+ *                                         // (overflows past 99 naturally, e.g.
+ *                                         // "0909100"). Unique per lab per day —
+ *                                         // see "invoiceCounters" below. NOT
+ *                                         // guaranteed globally unique across
+ *                                         // labs, and the same string can recur
+ *                                         // on the same ddmm in a later year.
  *   createdAt: number,                   // epoch ms
  *   expiresAt: Date,                     // createdAt + 180 days (TTL-style field)
  *
@@ -102,6 +109,20 @@ import generateInvoiceId from "../../utils/generateInvoiceId.js";
  *     by: { id: ObjectId, name: string },
  *   },
  * }
+ *
+ * ── "invoiceCounters" collection ─────────────────────────────────────────────
+ * One document per (lab, calendar day), incremented atomically to hand out
+ * the next sequence number for that lab's invoices that day:
+ * {
+ *   _id: ObjectId,
+ *   labId: ObjectId,
+ *   dateKey: string,   // "YYYYMMDD" in Asia/Dhaka time — the FULL date, so the
+ *                       // counter correctly restarts at 1 every real calendar
+ *                       // day (including across year boundaries), even though
+ *                       // the printed invoiceId only shows "ddmm".
+ *   seq: number,        // last sequence number handed out for this lab+day
+ * }
+ * Recommended unique index: { labId: 1, dateKey: 1 }
  * ──────────────────────────────────────────────────────────────────────────
  */
 
@@ -135,6 +156,24 @@ const paginatedResponse = (result, limit, cursorField) => {
   };
 };
 
+// Formats a timestamp into Asia/Dhaka day/month/year parts. Used to key the
+// daily invoice counter and to build the "ddmm" prefix of the invoiceId,
+// independent of the server's own timezone.
+const DHAKA_DATE_FORMATTER = new Intl.DateTimeFormat("en-GB", {
+  timeZone: "Asia/Dhaka",
+  day: "2-digit",
+  month: "2-digit",
+  year: "numeric",
+});
+
+const getDhakaDateParts = (ms) => {
+  const parts = DHAKA_DATE_FORMATTER.formatToParts(ms).reduce((acc, p) => {
+    acc[p.type] = p.value;
+    return acc;
+  }, {});
+  return { day: parts.day, month: parts.month, year: parts.year };
+};
+
 // ─── Reusable Schema Definitions ─────────────────────────────────────────────
 
 const PRODUCT_TYPES = ["product", "service", "medicine"];
@@ -162,16 +201,19 @@ const patientBodySchema = {
   },
 };
 
+// invoiceId is now "ddmm" (Asia/Dhaka) + a per-lab, per-day sequence number
+// zero-padded to at least 2 digits, e.g. "090901", "090902", ... "0909100"
+// once a lab passes 99 invoices in a day. Purely numeric, minimum 6 digits.
 const invoiceIdParamSchema = {
   type: "object",
   required: ["invoiceId"],
   properties: {
     invoiceId: {
       type: "string",
-      pattern: "^[A-NP-Z]{3}[1-9]{4}$",
-      minLength: 7,
-      maxLength: 7,
-      description: "Unique invoice ID (3 uppercase letters excluding O + 4 non-zero digits)",
+      pattern: "^[0-9]{6,10}$",
+      minLength: 6,
+      maxLength: 10,
+      description: "Sequential invoice ID: ddmm + per-lab daily sequence number (e.g. 090901)",
     },
   },
 };
@@ -342,7 +384,7 @@ const addInvoiceSchema = {
 const searchInvoiceSchema = {
   schema: {
     tags: ["Invoices"],
-    summary: "Search invoices by phone, invoiceId, or patient name",
+    summary: "Search invoices by invoiceId, phone, or patient name",
     querystring: {
       type: "object",
       required: ["q"],
@@ -442,6 +484,7 @@ const deleteInvoiceSchema = {
 
 async function invoiceRoutes(fastify) {
   const col = () => fastify.mongo.db.collection("invoices");
+  const countersCol = () => fastify.mongo.db.collection("invoiceCounters");
   const labId = (req) => toObjectId(req.user.labId);
   const userId = (req) => toObjectId(req.user.id);
 
@@ -601,23 +644,27 @@ async function invoiceRoutes(fastify) {
         }
       }
 
-      // ── Generate unique invoice ID ──────────────────────────────────────
-      let invoiceId;
-      for (let i = 0; i < 5; i++) {
-        const candidate = generateInvoiceId();
-        if (!(await col().findOne({ invoiceId: candidate }, { projection: { _id: 1 } }))) {
-          invoiceId = candidate;
-          break;
-        }
-        await new Promise((r) => setTimeout(r, 10));
-      }
-      if (!invoiceId) {
-        return reply.code(500).send({ error: "Failed to generate a unique invoice ID, please try again" });
-      }
-
-      // Single timestamp reused for createdAt, expiresAt, and each online
-      // test's default sampleCollectionDate, so they all agree.
+      // ── Generate sequential invoice ID ───────────────────────────────────
+      // Format: ddmm (Asia/Dhaka) + this lab's daily sequence number,
+      // zero-padded to 2 digits — e.g. "090901", "090902", "090903", ...
+      // The counter document is keyed on the FULL date so it correctly
+      // restarts at 1 every real calendar day (including the same ddmm a
+      // year later), even though only ddmm appears in the printed ID.
+      // findOneAndUpdate's $inc+upsert is atomic, so two staff at the same
+      // lab creating invoices at the same instant never get the same number.
       const createdAt = Date.now();
+      const { day, month, year } = getDhakaDateParts(createdAt);
+      const dateKey = `${year}${month}${day}`;
+
+      const counterUpdate = await countersCol().findOneAndUpdate(
+        { labId: labId(req), dateKey },
+        { $inc: { seq: 1 } },
+        { upsert: true, returnDocument: "after" },
+      );
+      // Driver-version tolerant: modern drivers return the document
+      // directly; some return it wrapped in `.value`.
+      const seq = (counterUpdate?.value ?? counterUpdate)?.seq;
+      const invoiceId = `${day}${month}${String(seq).padStart(2, "0")}`;
 
       // Sum of each test's own `commission` field — distinct from
       // amount.referrerCommission (the referring doctor/agent's cut).
@@ -745,19 +792,25 @@ async function invoiceRoutes(fastify) {
   // ── GET /invoice/search ────────────────────────────────────────────────────
   // Intentionally unguarded — see header cleanup notes: patient-lookup flows
   // that aren't gated by "invoiceList" on the frontend depend on this route.
+  //
+  // Priority for a numeric query: invoiceId is checked FIRST. invoiceId is
+  // purely numeric, 6-10 digits (ddmm + per-lab daily sequence). Only when a
+  // numeric query doesn't fit that shape (11-15 digits) does it fall back to
+  // being treated as a phone number. Anything non-numeric falls through to a
+  // patient-name search.
   fastify.get("/invoice/search", searchInvoiceSchema, async (req, reply) => {
     try {
       const q = req.query.q.trim();
-      const isPhone = /^\d{7,15}$/.test(q);
-      const isInvoiceId = /^[A-NP-Z]{3}[1-9]{4}$/i.test(q);
+      const isInvoiceId = /^[0-9]{6,10}$/.test(q);
+      const isPhone = !isInvoiceId && /^\d{7,15}$/.test(q);
 
       const baseMatch = { labId: labId(req), "deletion.status": false };
 
       let filter;
-      if (isPhone) {
+      if (isInvoiceId) {
+        filter = { ...baseMatch, invoiceId: q };
+      } else if (isPhone) {
         filter = { ...baseMatch, "patient.contactNumber": q };
-      } else if (isInvoiceId) {
-        filter = { ...baseMatch, invoiceId: q.toUpperCase() };
       } else {
         filter = { ...baseMatch, "patient.name": { $regex: q, $options: "i" } };
       }
@@ -784,7 +837,34 @@ async function invoiceRoutes(fastify) {
         .limit(30)
         .toArray();
 
-      return reply.send({ results, type: isPhone ? "phone" : isInvoiceId ? "invoiceId" : "name" });
+      // Exact invoiceId search, zero active matches: invoiceId is a per-lab-
+      // per-day unique 1:1 lookup (unlike phone/name, which are inherently
+      // multi-result), so it's worth telling apart "never existed" from
+      // "existed, but was deleted" instead of silently returning empty —
+      // same distinction outdoorReportRoutes.js's findReportableInvoice
+      // makes with its 404-vs-410 split. Not applied to phone/name: surfacing
+      // one deleted match buried among several active ones there would be
+      // more confusing than helpful.
+      let deletedInvoice = null;
+      if (isInvoiceId && results.length === 0) {
+        deletedInvoice = await col().findOne(
+          { invoiceId: q, labId: labId(req), "deletion.status": true },
+          { projection: { invoiceId: 1, "patient.name": 1, "deletion.at": 1, "deletion.by.name": 1 } },
+        );
+      }
+
+      return reply.send({
+        results,
+        type: isInvoiceId ? "invoiceId" : isPhone ? "phone" : "name",
+        deletedInvoice: deletedInvoice
+          ? {
+              invoiceId: deletedInvoice.invoiceId,
+              patientName: deletedInvoice.patient?.name ?? null,
+              deletedAt: deletedInvoice.deletion?.at ?? null,
+              deletedBy: deletedInvoice.deletion?.by?.name ?? null,
+            }
+          : null,
+      });
     } catch (err) {
       req.log.error(err);
       return reply.code(500).send({ error: "Search failed" });
@@ -933,7 +1013,7 @@ async function invoiceRoutes(fastify) {
     }
   });
 
-  // ── GET /invoice/:invoiceId ────────────────────────────────────────────────
+   // ── GET /invoice/:invoiceId ────────────────────────────────────────────────
   // FIX: previously returned the full raw document (no projection) — leaked
   // internal fields (labId, labKey, deletion, test commissions, referrer id,
   // etc.) to whatever consumes this route (PrintInvoice.jsx's print/share
@@ -947,6 +1027,11 @@ async function invoiceRoutes(fastify) {
   // on the list page showed them fine (that list comes from a *different*
   // route, GET /invoice/all, whose projection already included them).
   // Added the three below so both surfaces agree.
+  //
+  // FIX (this pass): also missing `deletion` entirely — callers like the
+  // Delete Invoices page's search-to-delete panel had no way to tell an
+  // already-deleted invoice apart from a live one, since `data.deletion`
+  // came back undefined either way. Added deletion.status/at/by.name.
   //
   // Intentionally unguarded — see header cleanup notes: powers the print/share
   // view, which isn't gated by "invoiceList" on the frontend.
@@ -983,6 +1068,9 @@ async function invoiceRoutes(fastify) {
             "amount.invoiceFee": 1,
             paymentMode: 1,
             collections: 1,
+            "deletion.status": 1,
+            "deletion.at": 1,
+            "deletion.by.name": 1,
           },
         },
       );

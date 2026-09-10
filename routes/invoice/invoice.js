@@ -22,7 +22,17 @@ import toObjectId from "../../utils/db.js";
  *   patient: {
  *     name: string,
  *     gender: "male" | "female" | "other",
- *     age: number,
+ *     // Age is stored as three parts instead of a single number, so very
+ *     // young patients (newborns, infants) can be recorded precisely —
+ *     // e.g. { years: 0, months: 5, days: 10 }. Display/format as a single
+ *     // string on the frontend ("24yrs 5mo 10d"), skipping zero parts.
+ *     // None of the three parts is individually required server-side —
+ *     // any that are omitted default to 0.
+ *     age: {
+ *       years: number,                   // 0–150, defaults to 0
+ *       months: number,                  // 0–11, defaults to 0
+ *       days: number,                    // 0–31, defaults to 0
+ *     },
  *     contactNumber: string,              // optional — may be an empty string
  *   },
  *
@@ -182,6 +192,21 @@ const PRODUCT_TYPES = ["product", "service", "medicine"];
 // (initial creation and later due-collection alike).
 const PAYMENT_MODES = ["cash", "bkash", "nagad", "card", "bank_transfer", "others"];
 
+// Age is three parts instead of a single integer, so infants/newborns can
+// be recorded precisely (e.g. 5 months 10 days old). None of the three is
+// individually required — the patient just needs at least one part filled
+// (enforced on the frontend); whichever part(s) are omitted default to 0.
+const patientAgeSchema = {
+  type: "object",
+  additionalProperties: false,
+  description: "Patient age as years / months / days — any part may be omitted (defaults to 0)",
+  properties: {
+    years: { type: "integer", minimum: 0, maximum: 150, default: 0, description: "Whole years of age (0–150)" },
+    months: { type: "integer", minimum: 0, maximum: 11, default: 0, description: "Additional months (0–11)" },
+    days: { type: "integer", minimum: 0, maximum: 31, default: 0, description: "Additional days (0–31)" },
+  },
+};
+
 const patientBodySchema = {
   type: "object",
   required: ["name", "gender", "age"],
@@ -190,7 +215,7 @@ const patientBodySchema = {
   properties: {
     name: { type: "string", minLength: 1, maxLength: 100, description: "Full name of the patient" },
     gender: { type: "string", enum: ["male", "female", "other"], description: "Gender of the patient" },
-    age: { type: "integer", minimum: 0, maximum: 150, description: "Age of the patient in years" },
+    age: patientAgeSchema,
     contactNumber: {
       type: "string",
       minLength: 0,
@@ -685,7 +710,14 @@ async function invoiceRoutes(fastify) {
         patient: {
           name: patient.name,
           gender: patient.gender,
-          age: patient.age,
+          age: {
+            // FIX: `years` previously had no fallback (unlike months/days),
+            // so an age object with years omitted would insert `undefined`
+            // for years instead of defaulting to 0.
+            years: patient.age.years ?? 0,
+            months: patient.age.months ?? 0,
+            days: patient.age.days ?? 0,
+          },
           contactNumber: patient.contactNumber ?? "",
         },
         referrer: referrer
@@ -1101,7 +1133,13 @@ async function invoiceRoutes(fastify) {
         patient: {
           name: patient.name.trim(),
           gender: patient.gender,
-          age: patient.age,
+          age: {
+            // FIX: `years` previously had no `?? 0` fallback here (unlike
+            // months/days) — same gap as in POST /invoice/add.
+            years: patient.age.years ?? 0,
+            months: patient.age.months ?? 0,
+            days: patient.age.days ?? 0,
+          },
           contactNumber: (patient.contactNumber ?? "").trim(),
         },
         updated: {

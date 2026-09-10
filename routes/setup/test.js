@@ -582,9 +582,6 @@ async function testRoutes(fastify) {
       const testDoc = {
         labId: labId(req),
         name: trimmedName,
-        nameKey, // ← kept for consistency/future querying; uniqueness is
-        //   enforced upstream by testCatalog's own nameKey index, so this
-        //   insert can't collide once the catalog insert above succeeded
         testId: catalogResult.insertedId, // ← generated just above, not an existing catalog entry
         categoryId,
         schemaId: null,

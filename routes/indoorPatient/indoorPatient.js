@@ -28,6 +28,12 @@
  *    field, so they're never touched by the TTL sweep. This is a PERMANENT,
  *    UNRECOVERABLE hard delete — see backfill script for pre-existing released
  *    patients, which won't have `purgeAt` until it's run once.
+ *  - Patient age: switched from a single integer to a { years, months, days }
+ *    object (mirrors the same shape used on invoices — see patientAgeSchema
+ *    and normalizePatientAge below). Any part omitted from the request
+ *    defaults to 0. Existing documents written before this change still hold
+ *    a plain integer in patient.age — run a backfill to convert them to
+ *    { years, months: 0, days: 0 } if old records need to match the new shape.
  */
 
 import { randomUUID } from "crypto";
@@ -58,13 +64,27 @@ const guardianSchema = {
   },
 };
 
+// Mirrors the age shape used on invoices — years / months / days, any part
+// may be omitted and defaults to 0 (see normalizePatientAge below, which is
+// what actually applies that default when writing to the DB).
+const patientAgeSchema = {
+  type: "object",
+  additionalProperties: false,
+  description: "Patient age as years / months / days — any part may be omitted (defaults to 0)",
+  properties: {
+    years: { type: "integer", minimum: 0, maximum: 150, default: 0, description: "Whole years of age (0–150)" },
+    months: { type: "integer", minimum: 0, maximum: 11, default: 0, description: "Additional months (0–11)" },
+    days: { type: "integer", minimum: 0, maximum: 31, default: 0, description: "Additional days (0–31)" },
+  },
+};
+
 const patientInfoSchema = {
   type: "object",
   required: ["name", "age", "gender", "contactNumber"],
   additionalProperties: false,
   properties: {
     name: { type: "string", minLength: 1, maxLength: 120 },
-    age: { type: "integer", minimum: 0, maximum: 150 },
+    age: patientAgeSchema,
     gender: { type: "string", enum: ["male", "female", "other"] },
     bloodGroup: { type: "string", enum: BLOOD_GROUPS },
     contactNumber: { type: "string", minLength: 10, maxLength: 15 },
@@ -387,6 +407,14 @@ const by = (req) => ({ id: toObjectId(req.user.id), name: req.user.name });
 // and means a single change here updates every query at once.
 const notDeletedFilter = (req) => ({ labId: toObjectId(req.user.labId), "deletion.at": null });
 
+// Mirrors CreateInvoice.jsx's normalizeAge on the frontend: any part left out
+// of the request body defaults to 0 rather than being stored as undefined.
+const normalizePatientAge = (age) => ({
+  years: Number.isInteger(age?.years) ? age.years : 0,
+  months: Number.isInteger(age?.months) ? age.months : 0,
+  days: Number.isInteger(age?.days) ? age.days : 0,
+});
+
 const generateAdmissionId = async (col, labId) => {
   const DIGIT_CHARS = "123456789";
   const LETTER_CHARS = "ABCDEFGHIJKLMNPQRSTUVWXYZ";
@@ -625,7 +653,7 @@ async function indoorPatientRoutes(fastify) {
         status: "admitted",
         patient: {
           name: patient.name.trim(),
-          age: patient.age,
+          age: normalizePatientAge(patient.age),
           gender: patient.gender,
           bloodGroup: patient.bloodGroup ?? null,
           contactNumber: patient.contactNumber.trim(),
@@ -707,7 +735,7 @@ async function indoorPatientRoutes(fastify) {
           {
             $set: {
               "patient.name": patient.name.trim(),
-              "patient.age": patient.age,
+              "patient.age": normalizePatientAge(patient.age),
               "patient.gender": patient.gender,
               "patient.bloodGroup": patient.bloodGroup ?? null,
               "patient.contactNumber": patient.contactNumber.trim(),
@@ -915,7 +943,7 @@ async function indoorPatientRoutes(fastify) {
     }
   });
 
-// ── POST /indoor-patient/:id/expense ────────────────────────────────────────
+  // ── POST /indoor-patient/:id/expense ────────────────────────────────────────
   fastify.post("/indoor-patient/:id/expense", { ...addExpenseSchema, ...requireAddExpense }, async (req, reply) => {
     try {
       const _id = toObjectId(req.params.id);

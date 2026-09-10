@@ -38,6 +38,51 @@ const moneyFieldSchema = {
 // real catalog categories.
 const MANUAL_TEST_CATEGORY_ID = "6aa0f23328b36d7a2a1819d6";
 
+// ─── Duplicate-name detection (manual tests) ───────────────────────────────
+// Mirrors the admin catalog's own normalizeTestName/levenshtein pair
+// (testRoutes.js, admin side) exactly, so a name collides the same way on
+// both sides of the app. Keep these two in sync if either changes.
+const FUZZY_SIMILARITY_THRESHOLD = 0.82;
+const FUZZY_MAX_RESULTS = 5;
+
+// Reduces a test name to a canonical comparison key by stripping everything
+// that's just formatting: case, whitespace, punctuation (., -, (), etc).
+// This is the key stored on `tests` (manual docs only) and on the
+// `testCatalog` doc created alongside it, backed by a unique index, so
+// exact-duplicate detection is an O(1) indexed lookup and race-safe under
+// concurrent writes.
+function normalizeTestName(name) {
+  return name
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[^a-z0-9]/g, "");
+}
+
+// Standard edit-distance calculation. Used only for the *soft* fuzzy-match
+// warning layer — exact duplicates are caught separately via nameKey.
+function levenshtein(a, b) {
+  if (a === b) return 0;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+
+  let prevRow = Array.from({ length: b.length + 1 }, (_, i) => i);
+
+  for (let i = 1; i <= a.length; i++) {
+    const currRow = [i];
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      currRow[j] = Math.min(
+        currRow[j - 1] + 1, // insertion
+        prevRow[j] + 1, // deletion
+        prevRow[j - 1] + cost, // substitution
+      );
+    }
+    prevRow = currRow;
+  }
+
+  return prevRow[b.length];
+}
+
 // ─── Schemas ──────────────────────────────────────────────────────────────────
 
 const getAllTestsSchema = {
@@ -173,6 +218,23 @@ const createManualTestSchema = {
   },
 };
 
+// Debounced by the frontend as the lab user types a manual test name.
+// Checks against the GLOBAL testCatalog (every lab), not just this lab's
+// own tests — because a manual add always creates a new testCatalog doc,
+// so a name can collide with any lab's prior manual entry, or with a real
+// catalog test the user simply didn't find via GET /test/catalog.
+const checkManualDuplicateSchema = {
+  schema: {
+    tags: ["Tests"],
+    summary: "Check whether a manual test name is an exact or near duplicate of any test in the global catalog",
+    querystring: {
+      type: "object",
+      required: ["name"],
+      properties: { name: { type: "string", minLength: 1 } },
+    },
+  },
+};
+
 const updateTestPriceSchema = {
   schema: {
     tags: ["Tests"],
@@ -247,6 +309,40 @@ async function testRoutes(fastify) {
   const catalogCol = () => fastify.mongo.db.collection("testCatalog");
   const labId = (req) => toObjectId(req.user.labId);
 
+  // Narrowed candidate set for fuzzy matching: pull only docs whose nameKey
+  // shares a short prefix with the target, since a genuine typo rarely
+  // changes the first couple characters. Queries the GLOBAL testCatalog —
+  // not this lab's own `tests` — because a manual add always creates a
+  // fresh testCatalog doc, so the thing that can actually collide is the
+  // shared catalog (across every lab), same collection/index the admin
+  // route (testRoutes.js, admin side) dedups against. Keeps this cheap
+  // without a text index — same approach as the admin catalog's own
+  // findFuzzyMatches.
+  async function findFuzzyMatches(nameKey, excludeId) {
+    if (nameKey.length < 2) return [];
+    const prefix = nameKey.slice(0, 2);
+
+    const candidates = await catalogCol()
+      .find(
+        {
+          nameKey: { $regex: `^${prefix}` },
+          ...(excludeId ? { _id: { $ne: excludeId } } : {}),
+        },
+        { projection: { name: 1, nameKey: 1 } },
+      )
+      .toArray();
+
+    const fuzzy = [];
+    for (const c of candidates) {
+      if (c.nameKey === nameKey) continue; // exact matches are handled separately
+      const dist = levenshtein(nameKey, c.nameKey);
+      const similarity = 1 - dist / Math.max(nameKey.length, c.nameKey.length);
+      if (similarity >= FUZZY_SIMILARITY_THRESHOLD) fuzzy.push({ ...c, similarity });
+    }
+
+    return fuzzy.sort((a, b) => b.similarity - a.similarity).slice(0, FUZZY_MAX_RESULTS);
+  }
+
   fastify.addHook("onRequest", fastify.authenticate);
   fastify.addHook("onRequest", fastify.authorize("manageTests"));
 
@@ -295,6 +391,28 @@ async function testRoutes(fastify) {
     } catch (err) {
       req.log.error(err);
       return reply.code(500).send({ error: "Failed to fetch test catalog" });
+    }
+  });
+
+  // ── GET /test/manual/check-duplicate?name=... ────────────────────────────
+  // Debounced by the frontend as the user types a manual test name — same
+  // contract as the admin catalog's GET /test/check-duplicate, and now
+  // querying the same testCatalog collection (globally, not per-lab), since
+  // that's the collection a manual add actually writes a new doc into.
+  // `exact` blocks submission client-side; `fuzzy` matches are
+  // informational only.
+  fastify.get("/test/manual/check-duplicate", { ...checkManualDuplicateSchema }, async (req, reply) => {
+    try {
+      const nameKey = normalizeTestName(req.query.name);
+      if (!nameKey) return reply.send({ exact: null, fuzzy: [] });
+
+      const exact = await catalogCol().findOne({ nameKey }, { projection: { name: 1 } });
+      const fuzzy = exact ? [] : await findFuzzyMatches(nameKey);
+
+      return reply.send({ exact, fuzzy });
+    } catch (err) {
+      req.log.error(err);
+      return reply.code(500).send({ error: "Failed to check duplicate test name" });
     }
   });
 
@@ -402,6 +520,15 @@ async function testRoutes(fastify) {
   //      testId, same shape as POST /test.
   // schemaId/isOnline start null/false — format gets attached later via the
   // existing FormatModal flow, same as any other test.
+  //
+  // Duplicate detection: `nameKey` is the normalized comparison key
+  // (normalizeTestName above), checked against the GLOBAL testCatalog —
+  // not this lab's own `tests` — because this route always creates a new
+  // testCatalog doc, so that's the collection whose uniqueness actually
+  // matters (and is exactly what the admin route's own unique index on
+  // testCatalog.nameKey already enforces). The findOne below gives a clean
+  // 409 in the common case; the E11000 catch on the catalog insert is the
+  // actual race-safe guarantee under concurrent writes from different labs.
   fastify.post("/test/manual", { ...createManualTestSchema }, async (req, reply) => {
     try {
       const { name, price, commission } = req.body;
@@ -413,20 +540,28 @@ async function testRoutes(fastify) {
         return reply.code(400).send({ error: "Commission cannot exceed price" });
       }
 
-      // Case-insensitive duplicate check against this lab's own tests only —
-      // a manual test only needs to be unique within the lab that's adding
-      // it, not across the whole shared catalog.
-      const escapedName = trimmedName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const existing = await col().findOne({
-        labId: labId(req),
-        name: { $regex: `^${escapedName}$`, $options: "i" },
-      });
-      if (existing) return reply.code(409).send({ error: "A test with this name already exists" });
+      // Case/formatting-insensitive duplicate check against the shared
+      // testCatalog (every lab) — matches "S. GPT"/"S GPT"/"S-GPT" etc.
+      // against any prior manual entry or real catalog test, not just this
+      // lab's own tests.
+      const nameKey = normalizeTestName(trimmedName);
+
+      const existingCatalog = await catalogCol().findOne({ nameKey }, { projection: { name: 1 } });
+      if (existingCatalog) {
+        // Kept as `error` (not `message`) to match this file's response
+        // shape everywhere else; existingTestId is extra, non-breaking.
+        return reply.code(409).send({
+          error: `A test named "${existingCatalog.name}" already exists in the catalog`,
+          existingTestId: existingCatalog._id,
+        });
+      }
 
       const categoryId = toObjectId(MANUAL_TEST_CATEGORY_ID);
 
       const catalogDoc = {
         name: trimmedName,
+        nameKey, // ← unique-indexed comparison key on testCatalog, same
+        //   field/index the admin route's own dedup relies on
         categoryId,
         defaultSchemaId: null,
         addedBylab: labId(req),
@@ -435,11 +570,21 @@ async function testRoutes(fastify) {
           name: req.user.name,
         },
       };
-      const catalogResult = await catalogCol().insertOne(catalogDoc);
+
+      let catalogResult;
+      try {
+        catalogResult = await catalogCol().insertOne(catalogDoc);
+      } catch (err) {
+        if (err.code === 11000) return reply.code(409).send({ error: "This test already exists" });
+        throw err;
+      }
 
       const testDoc = {
         labId: labId(req),
         name: trimmedName,
+        nameKey, // ← kept for consistency/future querying; uniqueness is
+        //   enforced upstream by testCatalog's own nameKey index, so this
+        //   insert can't collide once the catalog insert above succeeded
         testId: catalogResult.insertedId, // ← generated just above, not an existing catalog entry
         categoryId,
         schemaId: null,
@@ -447,6 +592,7 @@ async function testRoutes(fastify) {
         commission: finalCommission,
         createdAt: Date.now(),
       };
+
       const testResult = await col().insertOne(testDoc);
 
       return reply.code(201).send({ _id: testResult.insertedId, ...testDoc });

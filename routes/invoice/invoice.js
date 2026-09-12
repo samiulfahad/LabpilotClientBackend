@@ -458,6 +458,20 @@ const listInvoicesSchema = {
   },
 };
 
+const invoiceSummarySchema = {
+  schema: {
+    tags: ["Invoices"],
+    summary: "Get DB-aggregated ledger totals (billed/paid/due) and invoice count for a date range",
+    querystring: {
+      type: "object",
+      properties: {
+        startDate: { type: "integer", minimum: 0, description: "Filter start date as Unix timestamp (ms)" },
+        endDate: { type: "integer", minimum: 0, description: "Filter end date as Unix timestamp (ms)" },
+      },
+    },
+  },
+};
+
 const deletedInvoicesSchema = {
   schema: {
     tags: ["Invoices"],
@@ -963,7 +977,60 @@ async function invoiceRoutes(fastify) {
     }
   });
 
+  // ── GET /invoice/summary ────────────────────────────────────────────────
+  // Ledger totals (billed/paid/due) and invoice count aggregated over the
+  // FULL matching set in the given date range — not just whatever page of
+  // 20 GET /invoice/all happens to have loaded client-side. Same permission
+  // gate as the list itself.
+  fastify.get("/invoice/summary", { ...invoiceSummarySchema, ...requireInvoiceList }, async (req, reply) => {
+    try {
+      const { startDate, endDate } = req.query;
+      const match = { labId: labId(req), "deletion.status": false };
+      if (startDate || endDate) {
+        match.createdAt = {};
+        if (startDate) match.createdAt.$gte = Number(startDate);
+        if (endDate) match.createdAt.$lte = Number(endDate);
+      }
+
+      const [agg] = await col()
+        .aggregate([
+          { $match: match },
+          {
+            $group: {
+              _id: null,
+              count: { $sum: 1 },
+              totalBilled: { $sum: "$amount.final" },
+              totalPaid: { $sum: "$amount.paid" },
+            },
+          },
+        ])
+        .toArray();
+
+      const totalBilled = round2(agg?.totalBilled ?? 0);
+      const totalPaid = round2(agg?.totalPaid ?? 0);
+
+      return reply.send({
+        count: agg?.count ?? 0,
+        totalBilled,
+        totalPaid,
+        // Each invoice's own due is always >= 0 (paid is clamped to final on
+        // write), so totalBilled - totalPaid is a safe way to sum the dues
+        // without a second per-document computation.
+        totalDue: Math.max(0, round2(totalBilled - totalPaid)),
+      });
+    } catch (err) {
+      req.log.error(err);
+      return reply.code(500).send({ error: "Failed to fetch invoice summary" });
+    }
+  });
+
   // ── GET /invoice/all ───────────────────────────────────────────────────────
+  // FIX (this pass): projection now includes referrer.name/type and
+  // doctor.name — needed so InvoiceList.jsx can build its doctor/referrer
+  // filter dropdowns purely from the invoices already loaded on this page,
+  // instead of hitting /invoice/doctors or /invoice/required-data (which
+  // return the lab's ENTIRE doctor/referrer roster, regardless of whether
+  // those doctors/referrers were ever actually used on an invoice).
   fastify.get("/invoice/all", { ...listInvoicesSchema, ...requireInvoiceList }, async (req, reply) => {
     try {
       const { limit, cursor, startDate, endDate } = parsePaginationQuery(req.query);
@@ -986,6 +1053,9 @@ async function invoiceRoutes(fastify) {
               "patient.gender": 1,
               "patient.age": 1,
               "patient.contactNumber": 1,
+              "referrer.name": 1,
+              "referrer.type": 1,
+              "doctor.name": 1,
               "amount.final": 1,
               "amount.paid": 1,
               "tests.schemaId": 1,

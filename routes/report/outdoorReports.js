@@ -27,6 +27,11 @@
  *    soft-deleted invoice was returned as if active (search "found" it
  *    fine; only add/update/dates, which fetch the full doc with no
  *    projection, correctly 410'd).
+ *  - GET /outdoorReport/:invoiceId/:testId now also returns `overrides`: the
+ *    lab's custom reference ranges / values / units for this test (stored at
+ *    tests.schema.overrides), filtered to the report's schemaId. The upload
+ *    screen merges them into the admin schema so new reports are baked with
+ *    the lab's values.
  */
 
 import toObjectId from "../../utils/db.js";
@@ -144,8 +149,23 @@ const getReportSchema = {
 
 async function outdoorReportRoutes(fastify) {
   const invoicesCollection = () => fastify.mongo.db.collection("invoices");
+  const testsCollection = () => fastify.mongo.db.collection("tests");
   const labId = (req) => toObjectId(req.user.labId);
   const by = (req) => ({ id: toObjectId(req.user.id), name: req.user.name });
+
+  // This lab's custom reference range / value / unit overrides for a test,
+  // limited to the format (schemaId) the report is on. Overrides are
+  // wiped server-side whenever a test's format changes, but filtering by
+  // schemaId keeps this correct even if the invoice's snapshot schemaId
+  // differs from the test's current one.
+  const getTestOverrides = async (req, testId, schemaId) => {
+    if (!schemaId) return [];
+    const doc = await testsCollection().findOne(
+      { labId: labId(req), testId: toObjectId(testId) },
+      { projection: { "schema.overrides": 1 } },
+    );
+    return (doc?.schema?.overrides ?? []).filter((o) => String(o.schemaId) === String(schemaId));
+  };
 
   // Looks up an invoice by invoiceId + labId (no deletion filter, so we can
   // tell the two failure cases apart) and sends the appropriate error reply
@@ -360,7 +380,8 @@ async function outdoorReportRoutes(fastify) {
   });
 
   // ── GET /report/:invoiceId/:testId ──────────────────────────────────────
-  // Returns the report + patient info from the parent invoice.
+  // Returns the report + patient info from the parent invoice, plus this
+  // lab's range/unit overrides for the test's format.
   fastify.get("/outdoorReport/:invoiceId/:testId", { ...getReportSchema, ...requireDownload }, async (req, reply) => {
     try {
       const { invoiceId, testId } = req.params;
@@ -370,6 +391,8 @@ async function outdoorReportRoutes(fastify) {
 
       const test = invoice.tests.find((t) => t.testId.toString() === testId.toString());
       if (!test) return reply.code(404).send({ error: "Test not found in this invoice" });
+
+      const overrides = await getTestOverrides(req, testId, test.schemaId);
 
       return reply.send({
         report: test.report,
@@ -383,6 +406,7 @@ async function outdoorReportRoutes(fastify) {
         invoiceId: invoice.invoiceId,
         testName: test.name,
         schemaId: test.schemaId,
+        overrides,
         reportDate: test.report?.reportDate ?? null,
         sampleCollectionDate: test.report?.sampleCollectionDate ?? null,
       });

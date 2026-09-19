@@ -8,6 +8,11 @@
  * IPD is a hospital-only module — the onRequest hook below blocks diagnosticCenter
  * labs from reaching any route here, mirroring the isHospital guard pattern used
  * in cashmemo/commissionReport/salesReport routes.
+ *
+ * GET /indoorReport/:patientId/:testId also returns `overrides`: the lab's
+ * custom reference ranges / values / units for the test (tests.schema.overrides),
+ * filtered to the entry's schemaId. The upload screen merges them into the
+ * admin schema so new reports are baked with the lab's values.
  */
 
 import toObjectId from "../../utils/db.js";
@@ -118,8 +123,20 @@ const getReportSchema = {
 
 async function indoorReportRoutes(fastify) {
   const col = () => fastify.mongo.db.collection(COLLECTION);
+  const testsCollection = () => fastify.mongo.db.collection("tests");
   const labId = (req) => toObjectId(req.user.labId);
   const by = (req) => ({ id: toObjectId(req.user.id), name: req.user.name });
+
+  // This lab's custom reference range / value / unit overrides for a test,
+  // limited to the format (schemaId) the entry is on.
+  const getTestOverrides = async (req, testId, schemaId) => {
+    if (!schemaId) return [];
+    const doc = await testsCollection().findOne(
+      { labId: labId(req), testId: toObjectId(testId) },
+      { projection: { "schema.overrides": 1 } },
+    );
+    return (doc?.schema?.overrides ?? []).filter((o) => String(o.schemaId) === String(schemaId));
+  };
 
   fastify.addHook("onRequest", fastify.authenticate);
 
@@ -346,11 +363,14 @@ async function indoorReportRoutes(fastify) {
         return reply.code(404).send({ error: "Report entry not found for this test on this admission" });
       }
 
+      const overrides = await getTestOverrides(req, testId, reportEntry.schemaId);
+
       return reply.send({
         testId: reportEntry.testId,
         testName: reportEntry.name,
         schemaId: reportEntry.schemaId,
         addedAt: reportEntry.addedAt,
+        overrides,
         ...(reportEntry.schemaId && {
           report: reportEntry.report,
           isCompleted: reportEntry.isCompleted,

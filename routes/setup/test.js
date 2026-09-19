@@ -17,14 +17,6 @@ const testIdParamSchema = {
   },
 };
 
-const schemaIdParamSchema = {
-  type: "object",
-  required: ["schemaId"],
-  properties: {
-    schemaId: { ...objectIdSchema, description: "ObjectId of the schema" },
-  },
-};
-
 const moneyFieldSchema = {
   type: "number",
   minimum: 0,
@@ -116,27 +108,11 @@ const getCatalogSchema = {
   },
 };
 
-const getTestSchemaByTestIdSchema = {
-  schema: {
-    tags: ["Tests"],
-    summary: "Get report schemas for a test",
-    params: testIdParamSchema,
-  },
-};
-
 const getTestByIdSchema = {
   schema: {
     tags: ["Tests"],
     summary: "Get a single test by ID",
     params: testIdParamSchema,
-  },
-};
-
-const getSchemaByIdSchema = {
-  schema: {
-    tags: ["Schemas"],
-    summary: "Get a report schema by ID",
-    params: schemaIdParamSchema,
   },
 };
 
@@ -273,27 +249,6 @@ const updateTestCommissionSchema = {
   },
 };
 
-const updateTestSchemaIdSchema = {
-  schema: {
-    tags: ["Tests"],
-    summary: "Update (or unset) the report schema of a test",
-    params: testIdParamSchema,
-    body: {
-      type: "object",
-      required: ["schemaId"],
-      additionalProperties: false,
-      properties: {
-        schemaId: {
-          type: ["string", "null"],
-          minLength: 24,
-          maxLength: 24,
-          description: "Updated report schema ObjectId, or null to unset",
-        },
-      },
-    },
-  },
-};
-
 const deleteTestSchema = {
   schema: {
     tags: ["Tests"],
@@ -416,23 +371,6 @@ async function testRoutes(fastify) {
     }
   });
 
-  // ── GET /test/schema/:testId ──────────────────────────────────────────────
-  // NOTE: no longer filters on isActive — testSchemas docs don't reliably
-  // carry that field, so filtering on it was hiding all formats. Returns
-  // every schema for the test.
-  fastify.get("/test/schema/:testId", getTestSchemaByTestIdSchema, async (req, reply) => {
-    try {
-      const testId = toObjectId(req.params.testId);
-      if (!testId) return reply.code(400).send({ error: "Invalid test ID" });
-
-      const list = await fastify.mongo.db.collection("testSchemas").find({ testId }).toArray();
-      return reply.send(list);
-    } catch (err) {
-      req.log.error(err);
-      return reply.code(500).send({ error: "Failed to fetch test schemas" });
-    }
-  });
-
   // ── GET /test/:testId ─────────────────────────────────────────────────────
   fastify.get("/test/:testId", getTestByIdSchema, async (req, reply) => {
     try {
@@ -445,21 +383,6 @@ async function testRoutes(fastify) {
     } catch (err) {
       req.log.error(err);
       return reply.code(500).send({ error: "Failed to fetch test" });
-    }
-  });
-
-  // ── GET /schema/:schemaId ─────────────────────────────────────────────────
-  fastify.get("/schema/:schemaId", getSchemaByIdSchema, async (req, reply) => {
-    try {
-      const _id = toObjectId(req.params.schemaId);
-      if (!_id) return reply.code(400).send({ error: "Invalid schema ID" });
-
-      const schema = await fastify.mongo.db.collection("testSchemas").findOne({ _id });
-      if (!schema) return reply.code(404).send({ error: "Schema not found" });
-      return reply.send(schema);
-    } catch (err) {
-      req.log.error(err);
-      return reply.code(500).send({ error: "Failed to fetch schema" });
     }
   });
 
@@ -518,8 +441,7 @@ async function testRoutes(fastify) {
   //      catalog;
   //   2. the lab's own tests doc referencing that new catalog _id as
   //      testId, same shape as POST /test.
-  // schemaId/isOnline start null/false — format gets attached later via the
-  // existing FormatModal flow, same as any other test.
+  // schemaId/isOnline start null/false, same as any other test.
   //
   // Duplicate detection: `nameKey` is the normalized comparison key
   // (normalizeTestName above), checked against the GLOBAL testCatalog —
@@ -656,29 +578,6 @@ async function testRoutes(fastify) {
     } catch (err) {
       req.log.error(err);
       return reply.code(500).send({ error: "Failed to update test commission" });
-    }
-  });
-
-  // ── PATCH /test/:testId/schema ────────────────────────────────────────────
-  fastify.patch("/test/:testId/schema", { ...updateTestSchemaIdSchema }, async (req, reply) => {
-    try {
-      const _id = toObjectId(req.params.testId);
-      if (!_id) return reply.code(400).send({ error: "Invalid test ID" });
-
-      const { schemaId } = req.body;
-      const update = {
-        schemaId: schemaId ? toObjectId(schemaId) : null,
-        updated: { at: Date.now(), by: { id: toObjectId(req.user.id), name: req.user.name } },
-      };
-
-      const result = await col().updateOne({ _id, labId: labId(req) }, { $set: update });
-      if (result.matchedCount === 0) return reply.code(404).send({ error: "Test not found" });
-
-      const updated = await col().findOne({ _id, labId: labId(req) });
-      return reply.send(updated);
-    } catch (err) {
-      req.log.error(err);
-      return reply.code(500).send({ error: "Failed to update test schema" });
     }
   });
 

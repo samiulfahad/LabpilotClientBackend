@@ -28,6 +28,7 @@ import setPasswordRoutes from "./routes/setPassword/setPassword.js";
 import referrerRoutes from "./routes/setup/referrer.js";
 import staffRoutes from "./routes/setup/staff.js";
 import testRoutes from "./routes/setup/test.js";
+import testConfigRoutes from "./routes/setup/testConfig.js";
 import productRoutes from "./routes/setup/product.js";
 import doctorRoutes from "./routes/setup/doctor.js";
 import admissionSpaceRoutes from "./routes/setup/admissionSpace.js";
@@ -177,6 +178,9 @@ fastify.register(testRoutes, { prefix: API });
 fastify.register(productRoutes, { prefix: API });
 fastify.register(invoiceRoutes, { prefix: API });
 fastify.register(myActivityRoutes, { prefix: API });
+
+// Manage Test Config
+fastify.register(testConfigRoutes, { prefix: API });
 
 // Outdoor Reports
 fastify.register(outdoorReportRoutes, { prefix: API });

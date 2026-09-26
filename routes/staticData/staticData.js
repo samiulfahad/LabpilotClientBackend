@@ -65,7 +65,8 @@ export const ALLOWED_PERMISSIONS = [
   { key: "manageProducts", label: "পণ্য, ঔষধ, সেবা ম্যানেজমেন্ট", module: "setup", for: "both" },
   { key: "manageReferrers", label: "রেফারার ম্যানেজমেন্ট", module: "setup", for: "both" },
   { key: "manageDoctors", label: "ডাক্তার ম্যানেজমেন্ট", module: "setup", for: "both" },
-  { key: "manageTests", label: "ল্যাব টেস্ট ম্যানেজমেন্ট", module: "setup", for: "both" },
+  { key: "manageTests", label: "টেস্টের মূল্য ও কমিশন", module: "setup", for: "both" },
+  { key: "manageTestConfig", label: "টেস্ট ফরম্যাট", module: "setup", for: "both" },
   { key: "manageStaffs", label: "স্টাফ অ্যাকাউন্ট ম্যানেজমেন্ট", module: "setup", for: "both" },
   { key: "manageAdmissionSpace", label: "রোগী ভর্তির ওয়ার্ড, আইসিইউ ইত্যাদি", module: "setup", for: "hospitalOnly" },
   { key: "manageBilling", label: "মাসিক বিলিং", module: "billing", for: "both" },
@@ -89,8 +90,6 @@ export const ALLOWED_DESIG_VALUES = new Set(ALLOWED_DESIGNATIONS.map((d) => d.va
 export const ALLOWED_PERM_KEYS = new Set(ALLOWED_PERMISSIONS.map((p) => p.key));
 
 async function staticDataRoutes(fastify) {
-
-  
   // ── GET /departments ──────────────────────────────────────────────────────
   fastify.get(
     "/departments",

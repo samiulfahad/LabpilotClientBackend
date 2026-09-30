@@ -1,8 +1,10 @@
 // ── routes/billing/billing.js  (client backend) ──────────────────────────────
+// Read-only for labs. There is intentionally NO route here that can mark a bill
+// as paid. Payments are received manually via bKash and marked paid from the
+// internal / super-admin backend, which must call invalidateBillingCache(labId)
+// after updating the bill so the lab is unblocked immediately.
 
 import toObjectId from "../../utils/db.js";
-
-const OBJECT_ID_PATTERN = "^[a-fA-F0-9]{24}$";
 
 const billingStatusSchema = {
   schema: {
@@ -18,21 +20,6 @@ const billingHistorySchema = {
   },
 };
 
-const billingPaySchema = {
-  schema: {
-    tags: ["Billing"],
-    summary: "Mark a bill as paid (payment gateway integration point)",
-    params: {
-      type: "object",
-      required: ["billingId"],
-      additionalProperties: false,
-      properties: {
-        billingId: { type: "string", pattern: OBJECT_ID_PATTERN },
-      },
-    },
-  },
-};
-
 async function billingRoutes(fastify) {
   const col = () => fastify.mongo.db.collection("billings");
 
@@ -44,15 +31,7 @@ async function billingRoutes(fastify) {
   // Returns the latest unpaid bill for the authenticated lab.
   // Intentionally NOT gated behind "manageBilling" — this powers a banner
   // every logged-in staff member should see, not just billing admins.
-  // Backed by billingGuard's cached getBillingStatus (5-min TTL) instead of a
-  // live query, since this route gets hit on every app load / poll interval
-  // across every staff session for the lab.
-  //
-  // `bill` is mapped 1:1 from the widened getBillingStatus() shape — id,
-  // invoiceCount, breakdown, and the billing period are included alongside
-  // amount/dueDate so the frontend's current-bill card (invoice count, fee
-  // breakdown accordion, and the Pay button's billId) all work off this
-  // endpoint the same way they already do off /billing/history.
+  // Backed by billingGuard's cached getBillingStatus (5-min TTL).
   fastify.get("/billing/status", billingStatusSchema, async (req, reply) => {
     try {
       const status = await fastify.getBillingStatus(toObjectId(req.user.labId));
@@ -107,37 +86,6 @@ async function billingRoutes(fastify) {
     } catch (err) {
       req.log.error(err);
       return reply.code(500).send({ error: "Failed to fetch billing history" });
-    }
-  });
-
-  // ── POST /billing/pay/:billingId ──────────────────────────────────────────
-  // Labs pay their own bills. Replace the body with a payment gateway webhook later.
-  fastify.post("/billing/pay/:billingId", { ...billingPaySchema, ...requireManageBilling }, async (req, reply) => {
-    try {
-      const labId = toObjectId(req.user.labId);
-
-      const result = await col().updateOne(
-        { _id: toObjectId(req.params.billingId), labId, status: "unpaid" },
-        {
-          $set: {
-            status: "paid",
-            paidAt: Date.now(),
-            paidBy: { id: toObjectId(req.user.id), name: req.user.name },
-          },
-        },
-      );
-
-      if (result.matchedCount === 0) {
-        return reply.code(404).send({ error: "Bill not found or already paid" });
-      }
-
-      // Unblock the lab immediately — invalidate the in-memory billing guard cache
-      fastify.invalidateBillingCache(labId);
-
-      return reply.send({ success: true });
-    } catch (err) {
-      req.log.error(err);
-      return reply.code(500).send({ error: "Failed to mark bill as paid" });
     }
   });
 }

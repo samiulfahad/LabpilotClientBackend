@@ -625,7 +625,7 @@ async function invoiceRoutes(fastify) {
       if (isBlocked) {
         return reply.code(402).send({
           error:
-            "Your account has an overdue bill. Please clear your outstanding balance to continue creating invoices.",
+            "নতুন ইনভয়েস তৈরির জন্য আপনার প্রতিষ্ঠানের বকেয়া বিল পরিশোধ করুন",
         });
       }
 

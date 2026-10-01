@@ -26,15 +26,54 @@
  *    strips the field entirely and the check silently no-ops, so a
  *    soft-deleted invoice was returned as if active (search "found" it
  *    fine; only add/update/dates, which fetch the full doc with no
- *    projection, correctly 410'd).
+ *    projection, correctly 410'd). The projection now lives in
+ *    REPORT_PROJECTION, shared with the list route.
  *  - GET /outdoorReport/:invoiceId/:testId now also returns `overrides`: the
  *    lab's custom reference ranges / values / units for this test (stored at
  *    tests.schema.overrides), filtered to the report's schemaId. The upload
  *    screen merges them into the admin schema so new reports are baked with
  *    the lab's values.
+ *  - GET /outdoorReport (list) returns the newest invoices, cursor-paginated
+ *    on _id (ObjectId, creation-ordered). invoiceId can't be used for
+ *    ordering because it's ddmm + sequence and doesn't sort across months.
+ *    Needs the index: db.invoices.createIndex({ labId: 1, _id: -1 })
  */
 
 import toObjectId from "../../utils/db.js";
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+// Shared by GET /outdoorReport (list) and GET /outdoorReport/:invoiceId.
+// Must include "deletion.status" — see header note.
+const REPORT_PROJECTION = {
+  invoiceId: 1,
+  createdAt: 1,
+  "patient.name": 1,
+  "patient.gender": 1,
+  "patient.age": 1,
+  "patient.contactNumber": 1,
+  "amount.initial": 1,
+  "amount.final": 1,
+  "amount.paid": 1,
+  "tests.testId": 1,
+  "tests.name": 1,
+  "tests.price": 1,
+  "tests.schemaId": 1,
+  "tests.isCompleted": 1,
+  "tests.report.sampleCollectionDate": 1,
+  "tests.report.reportDate": 1,
+  // MetaModal on the frontend reads these four fields to show
+  // "Created by" / "Last edited by". Without them here, Mongo strips the
+  // fields from every response and the UI always shows "তথ্য নেই".
+  "tests.completedAt": 1,
+  "tests.completedBy": 1,
+  "tests.updatedAt": 1,
+  "tests.updatedBy": 1,
+  paymentMode: 1,
+  "deletion.status": 1,
+};
+
+const LIST_PAGE_SIZE = 40;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -65,6 +104,24 @@ const invoiceIdPropertySchema = {
   minLength: 6,
   maxLength: 10,
   description: "Sequential invoice ID: ddmm + per-lab daily sequence number (e.g. 090901)",
+};
+
+const listReportsSchema = {
+  schema: {
+    tags: ["Outdoor Reports"],
+    summary: "List recent invoices (newest first), cursor-paginated",
+    querystring: {
+      type: "object",
+      properties: {
+        cursor: {
+          type: "string",
+          minLength: 24,
+          maxLength: 24,
+          description: "_id of the last item from the previous page",
+        },
+      },
+    },
+  },
 };
 
 const getSchemaParamSchema = {
@@ -199,42 +256,47 @@ async function outdoorReportRoutes(fastify) {
   const requireDownload = { onRequest: [fastify.authorize("testReportDownload")] };
   const requireUpload = { onRequest: [fastify.authorize("testReportUpload")] };
 
+  // ── GET /outdoorReport?cursor= ──────────────────────────────────────────
+  // Newest-first list of non-deleted invoices, LIST_PAGE_SIZE per page.
+  // Cursor is the _id of the last item of the previous page. Registered
+  // before /outdoorReport/:invoiceId for readability (find-my-way would
+  // route it correctly either way).
+  fastify.get("/outdoorReport", listReportsSchema, async (req, reply) => {
+    try {
+      const filter = { labId: labId(req), "deletion.status": { $ne: true } };
+
+      if (req.query.cursor) {
+        const cursorId = toObjectId(req.query.cursor);
+        if (!cursorId) return reply.code(400).send({ error: "Invalid cursor" });
+        filter._id = { $lt: cursorId };
+      }
+
+      // Fetch one extra to know whether another page exists
+      const docs = await invoicesCollection()
+        .find(filter, { projection: { _id: 1, ...REPORT_PROJECTION } })
+        .sort({ _id: -1 })
+        .limit(LIST_PAGE_SIZE + 1)
+        .toArray();
+
+      const hasMore = docs.length > LIST_PAGE_SIZE;
+      const page = hasMore ? docs.slice(0, LIST_PAGE_SIZE) : docs;
+      const nextCursor = hasMore ? String(page[page.length - 1]._id) : null;
+
+      return reply.send({
+        invoices: page.map(({ _id, ...rest }) => rest),
+        nextCursor,
+      });
+    } catch (err) {
+      req.log.error(err);
+      return reply.code(500).send({ error: "Failed to fetch invoices" });
+    }
+  });
+
   // GET Patient
   fastify.get("/outdoorReport/:invoiceId", async (req, reply) => {
     try {
       const { invoiceId } = req.params;
-      const invoice = await findReportableInvoice(req, reply, invoiceId, {
-        _id: 0,
-        invoiceId: 1,
-        createdAt: 1,
-        "patient.name": 1,
-        "patient.gender": 1,
-        "patient.age": 1,
-        "patient.contactNumber": 1,
-        "amount.initial": 1,
-        "amount.final": 1,
-        "amount.paid": 1,
-        "tests.testId": 1,
-        "tests.name": 1,
-        "tests.price": 1,
-        "tests.schemaId": 1,
-        "tests.isCompleted": 1,
-        "tests.report.sampleCollectionDate": 1,
-        "tests.report.reportDate": 1,
-        // Previously missing — MetaModal on the frontend reads these
-        // four fields to show "Created by" / "Last edited by" in the
-        // details tab. Without them here, Mongo strips the fields from
-        // every response and the UI always shows "তথ্য নেই" (no info)
-        // regardless of whether the report was actually uploaded/edited.
-        "tests.completedAt": 1,
-        "tests.completedBy": 1,
-        "tests.updatedAt": 1,
-        "tests.updatedBy": 1,
-        paymentMode: 1,
-        // Required so findReportableInvoice's soft-delete check can
-        // actually see the field — see helper's doc comment.
-        "deletion.status": 1,
-      });
+      const invoice = await findReportableInvoice(req, reply, invoiceId, { _id: 0, ...REPORT_PROJECTION });
       if (!invoice) return;
       return reply.send(invoice);
     } catch (err) {

@@ -13,6 +13,9 @@
  * custom reference ranges / values / units for the test (tests.schema.overrides),
  * filtered to the entry's schemaId. The upload screen merges them into the
  * admin schema so new reports are baked with the lab's values.
+ *
+ * The report header shows the admission's supervising doctor (supervisorDoctor),
+ * returned as `doctorName`. The referrer is intentionally not returned.
  */
 
 import toObjectId from "../../utils/db.js";
@@ -181,11 +184,14 @@ async function indoorReportRoutes(fastify) {
               status: 1,
               patient: 1,
               reports: 1,
+              "supervisorDoctor.name": 1, // ← doctor shown on the report
             },
           },
         );
         if (!patient) return reply.code(404).send({ error: "Indoor patient not found" });
-        return reply.send(patient);
+
+        const { supervisorDoctor, ...rest } = patient;
+        return reply.send({ ...rest, doctorName: supervisorDoctor?.name ?? "" });
       } catch (err) {
         req.log.error(err);
         return reply.code(500).send({ error: "Failed to fetch indoor patient" });
@@ -382,7 +388,7 @@ async function indoorReportRoutes(fastify) {
           sampleCollectionDate: reportEntry.report?.sampleCollectionDate ?? null,
         }),
         patient: admission.patient,
-        referrer: admission.referrer,
+        doctorName: admission.supervisorDoctor?.name ?? "", // ← replaces `referrer`
         admissionId: admission.admissionId,
       });
     } catch (error) {

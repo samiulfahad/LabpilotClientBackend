@@ -37,6 +37,10 @@
  *    on _id (ObjectId, creation-ordered). invoiceId can't be used for
  *    ordering because it's ddmm + sequence and doesn't sort across months.
  *    Needs the index: db.invoices.createIndex({ labId: 1, _id: -1 })
+ *  - The report header shows the invoice's doctor (invoice.doctor.name),
+ *    returned as `doctorName` by both GET /outdoorReport/:invoiceId and
+ *    GET /outdoorReport/:invoiceId/:testId. The referrer is intentionally
+ *    not returned by either.
  */
 
 import toObjectId from "../../utils/db.js";
@@ -52,6 +56,7 @@ const REPORT_PROJECTION = {
   "patient.gender": 1,
   "patient.age": 1,
   "patient.contactNumber": 1,
+  "doctor.name": 1,
   "amount.initial": 1,
   "amount.final": 1,
   "amount.paid": 1,
@@ -293,12 +298,15 @@ async function outdoorReportRoutes(fastify) {
   });
 
   // GET Patient
+  // Returns the invoice summary with `doctor` flattened to `doctorName`.
   fastify.get("/outdoorReport/:invoiceId", async (req, reply) => {
     try {
       const { invoiceId } = req.params;
       const invoice = await findReportableInvoice(req, reply, invoiceId, { _id: 0, ...REPORT_PROJECTION });
       if (!invoice) return;
-      return reply.send(invoice);
+
+      const { doctor, ...rest } = invoice;
+      return reply.send({ ...rest, doctorName: doctor?.name ?? "" });
     } catch (err) {
       req.log.error(err);
       return reply.code(500).send({ error: "Failed to fetch invoice summary" });
@@ -464,7 +472,7 @@ async function outdoorReportRoutes(fastify) {
         updatedAt: test.updatedAt ?? null,
         updatedBy: test.updatedBy ?? null,
         patient: invoice.patient,
-        referrer: invoice.referrer,
+        doctorName: invoice.doctor?.name ?? "", // ← replaces `referrer`
         invoiceId: invoice.invoiceId,
         testName: test.name,
         schemaId: test.schemaId,

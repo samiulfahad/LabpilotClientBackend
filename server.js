@@ -105,7 +105,7 @@ await fastify.register(cors, {
   ],
   methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
-  exposedHeaders: ["X-Billing-Due", "X-Billing-Overdue", "X-Billing-Due-Date", "x-internal-secret"],
+  exposedHeaders: ["X-Billing-Due", "X-Billing-Overdue", "X-Billing-Due-Date"],
   credentials: true,
 });
 

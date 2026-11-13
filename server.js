@@ -100,7 +100,8 @@ await fastify.register(cors, {
     "https://www.labpilotpro.com",
     "http://localhost:5173",
     "http://localhost:5174",
-    "https://rumonmedia.netlify.app"
+    "https://rumonmedia.netlify.app",
+    "https://labpilotadminbackend.up.railway.app"
   ],
   methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
